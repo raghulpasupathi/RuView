@@ -89,7 +89,9 @@ class AdaptiveCoarseDetector:
             near_field_penalty <= self.cfg.near_field_block_threshold
             and in_between_score >= self.cfg.in_between_presence_threshold
         )
-        final_presence = self._stable_presence and between_gate
+        # Keep between_gate as diagnostics only. Hard-gating presence here made
+        # true in-between standing cases disappear.
+        final_presence = self._stable_presence
 
         if not final_presence:
             level = MotionLevel.ABSENT
@@ -101,9 +103,6 @@ class AdaptiveCoarseDetector:
         conf = float(np.clip(abs(self._score - 0.5) * 2.0, 0.0, 1.0))
         if fallback_result is not None:
             conf = max(conf, float(fallback_result.confidence))
-        if not between_gate:
-            conf = min(conf, 0.89)
-
         result = SensingResult(
             motion_level=level,
             confidence=conf,
@@ -129,4 +128,3 @@ class AdaptiveCoarseDetector:
             "motion_n": mot_n,
         }
         return result, diag
-

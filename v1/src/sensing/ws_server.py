@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import http
 import json
 import logging
 import math
@@ -13,7 +14,7 @@ import signal
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 from v1.src.sensing.classifier import MotionLevel, PresenceClassifier, SensingResult
 from v1.src.sensing.feature_extractor import RssiFeatureExtractor, RssiFeatures
@@ -171,9 +172,11 @@ class SensingServer:
         result_raw: SensingResult,
         result_display: SensingResult,
         raw_presence: bool,
+        samples: Optional[List[WifiSample]] = None,
         hf_probs: Optional[Dict[str, float]] = None,
         detector_diag: Optional[Dict[str, float]] = None,
     ) -> str:
+        rssi_window = [float(s.rssi_dbm) for s in (samples or [])[-80:]]
         msg = {
             "type": "sensing_update",
             "timestamp": time.time(),
@@ -208,6 +211,7 @@ class SensingServer:
                 "hf_probs": hf_probs or {},
                 "detector": detector_diag or {},
             },
+            "rssi_window": rssi_window,
             "signal_field": generate_signal_field(features, result_display),
         }
         return json.dumps(msg)
@@ -279,14 +283,13 @@ class SensingServer:
                     raw_pres = adaptive_result.presence_detected
                     stable = self.hysteresis.update(raw_pres)
                     display = replace(adaptive_result, presence_detected=stable)
-                    if display.confidence < 0.80:
-                        display = replace(display, motion_level=MotionLevel.ABSENT, presence_detected=False)
 
                     msg = self._build_message(
                         features,
                         adaptive_result,
                         display,
                         raw_pres,
+                        samples=samples,
                         hf_probs=hf_probs,
                         detector_diag=detector_diag,
                     )
@@ -328,13 +331,13 @@ class SensingServer:
             pass
 
 
-def _http_response(status: int, content: bytes, content_type: str = "text/plain; charset=utf-8") -> Tuple[int, List[Tuple[str, str]], bytes]:
-    headers = [
-        ("Content-Type", content_type),
-        ("Content-Length", str(len(content))),
-        ("Cache-Control", "no-store"),
-    ]
-    return status, headers, content
+def _http_response(connection, status: int, content: bytes, content_type: str = "text/plain; charset=utf-8"):
+    response = connection.respond(http.HTTPStatus(status), content.decode("utf-8", errors="replace"))
+    response.body = content
+    response.headers["Content-Type"] = content_type
+    response.headers["Content-Length"] = str(len(content))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def parse_args() -> ServerConfig:
@@ -395,8 +398,13 @@ def main() -> None:
 
     server.collector.start()
 
-    async def handler(websocket, path):
+    async def handler(websocket):
         # websocket endpoint
+        path = "/"
+        try:
+            path = websocket.request.path
+        except Exception:
+            pass
         if path not in ("/ws/sensing", "/"):
             await websocket.close()
             return
@@ -411,10 +419,17 @@ def main() -> None:
             server.clients.discard(websocket)
             logger.info("WS client disconnected: %s", websocket.remote_address)
 
-    async def process_request(path, request_headers):
-        if path in ("/ws/sensing", "/"):
-            # let websockets handle upgrade when requested
+    async def process_request(connection, request):
+        path = request.path
+        is_ws_upgrade = request.headers.get("Upgrade", "").lower() == "websocket"
+
+        if path in ("/ws/sensing", "/") and is_ws_upgrade:
+            # websocket upgrade path
             return None
+
+        if path == "/ws/sensing":
+            return _http_response(connection, 426, b"Use WebSocket upgrade at /ws/sensing\n")
+
         if path == "/health":
             body = json.dumps({
                 "ok": True,
@@ -423,13 +438,13 @@ def main() -> None:
                 "node_distance_m": server.config.node_distance_m,
                 "last": server._last_broadcast,
             }).encode("utf-8")
-            return _http_response(200, body, "application/json; charset=utf-8")
+            return _http_response(connection, 200, body, "application/json; charset=utf-8")
         if path in ("/", "/presence-dashboard.html"):
             page = _ROOT / "ui" / "presence-dashboard.html"
             if page.exists():
-                return _http_response(200, page.read_bytes(), "text/html; charset=utf-8")
-            return _http_response(404, b"ui/presence-dashboard.html missing\n")
-        return _http_response(404, b"not found\n")
+                return _http_response(connection, 200, page.read_bytes(), "text/html; charset=utf-8")
+            return _http_response(connection, 404, b"ui/presence-dashboard.html missing\n")
+        return _http_response(connection, 404, b"not found\n")
 
     print()
     print(f"  HTTP  http://{config.host}:{config.port}/health")

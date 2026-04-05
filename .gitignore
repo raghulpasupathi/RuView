@@ -258,3 +258,7 @@ _server_out.log
 _server_err.log
 _server_run.log
 trained_models/
+
+# Strong runtime artifact ignore (machine-specific, often includes local paths)
+**/.claude-flow/
+**/.vite/

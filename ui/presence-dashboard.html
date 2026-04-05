@@ -24,6 +24,9 @@
     .gate-box { margin-top:.6rem; border:1px solid var(--border); border-radius:6px; padding:.5rem; background:#0a101c; font-size:.74rem; }
     .gate-title { font-weight:600; color:#cde1ff; margin-bottom:.35rem; }
     .gate-doc { color: var(--muted); font-size:.68rem; line-height:1.35; margin-bottom:.35rem; }
+    .spark-wrap { margin-top:.6rem; border:1px solid var(--border); border-radius:6px; padding:.45rem; background:#0a101c; }
+    #rssi-spark { width:100%; height:72px; display:block; }
+    .spark-meta { display:flex; justify-content:space-between; font-size:.67rem; color:var(--muted); margin-top:.25rem; }
     .dot { width:8px; height:8px; border-radius:50%; background:var(--hot); display:inline-block; margin-right:6px; }
     .dot.live { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
     .overlay-3d { position:absolute; left:12px; right:12px; bottom:12px; color: var(--muted); font-size:.72rem; pointer-events:none; }
@@ -53,18 +56,31 @@
       </dl>
       <div class="gate-box">
         <div class="gate-title">Render Gate</div>
-        <div class="gate-doc">Person tag + green board ON when: presence=yes, confidence >= 80%, near-field <= 0.35, between_gate=1.</div>
+        <div class="gate-doc">Person tag + green board ON when presence (stable or raw) is true and either confidence >= 80% or strong in-between score (between_gate=1 with score >= 0.70).</div>
         <div class="status-row"><span>Gate now</span><strong id="gate-now">-</strong></div>
         <div class="status-row"><span>Between gate</span><strong id="gate-between">-</strong></div>
         <div class="status-row"><span>In-between score</span><strong id="gate-ibs">-</strong></div>
         <div class="status-row"><span>Attenuation</span><strong id="gate-atten">-</strong></div>
+      </div>
+      <div class="spark-wrap">
+        <div class="gate-title" style="margin-bottom:.2rem;">Mean RSSI (recent ticks)</div>
+        <svg id="rssi-spark" viewBox="0 0 320 72" preserveAspectRatio="none">
+          <polyline id="rssi-spark-line" points="" fill="none" stroke="#2f92ff" stroke-width="2" />
+        </svg>
+        <div class="spark-meta"><span id="rssi-min">min: -</span><span id="rssi-cur">cur: -</span><span id="rssi-max">max: -</span></div>
+      </div>
+      <div class="spark-wrap">
+        <div class="gate-title" style="margin-bottom:.2rem;">HF Probabilities</div>
+        <div class="status-row"><span>Absent</span><strong id="p-absent">-</strong></div>
+        <div class="status-row"><span>Still</span><strong id="p-still">-</strong></div>
+        <div class="status-row"><span>Active</span><strong id="p-active">-</strong></div>
       </div>
       <div style="margin-top:.55rem; font-size:.72rem; color:var(--muted);">Event log</div>
       <div id="log"></div>
     </aside>
     <div id="viewport">
       <div class="render-stamp" id="render-stamp">Frame: -<br/>Age: -</div>
-      <div class="overlay-3d">Violet sphere = router/AP proxy · Cyan sphere = client node · Red marker = person proxy</div>
+      <div class="overlay-3d">Violet sphere = router/AP proxy | Cyan sphere = client node | Red marker = person proxy</div>
     </div>
   </div>
   <script src="https://unpkg.com/three@0.146.0/build/three.min.js"></script>
@@ -72,6 +88,8 @@
   <script>
   (function(){
     const gridSize = 20;
+    const rssiHistory = [];
+    const rssiHistoryMax = 80;
     const viewport = document.getElementById('viewport');
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0a0e1a);
@@ -130,8 +148,11 @@
       const confGate = Number(cl.confidence||0) >= 0.80;
       const nearPenalty = Number(det.near_field_penalty ?? 1);
       const betweenGate = Number(det.between_gate ?? 0) >= 0.5;
-      const strict = !!cl.presence && confGate && nearPenalty <= 0.35 && betweenGate;
-      return { strict, confGate, nearPenalty, betweenGate };
+      const inBetweenScore = Number(det.in_between_score ?? 0);
+      const presenceGate = !!cl.presence || !!cl.raw_presence;
+      const strongBetween = betweenGate && inBetweenScore >= 0.70;
+      const strict = presenceGate && (confGate || strongBetween);
+      return { strict, confGate, nearPenalty, betweenGate, inBetweenScore, presenceGate, strongBetween };
     }
 
     function setConn(ok, text){
@@ -145,11 +166,35 @@
       el.textContent = line + '\n' + el.textContent.split('\n').slice(0,40).join('\n');
     }
 
+    function renderSparkline(values){
+      const line = document.getElementById('rssi-spark-line');
+      if(!Array.isArray(values) || values.length < 2){
+        line.setAttribute('points', '');
+        document.getElementById('rssi-min').textContent = 'min: -';
+        document.getElementById('rssi-cur').textContent = 'cur: -';
+        document.getElementById('rssi-max').textContent = 'max: -';
+        return;
+      }
+      const min = Math.min(...values), max = Math.max(...values);
+      const span = Math.max(0.1, max - min);
+      const w = 320, h = 72, pad = 4;
+      const pts = values.map((v, i) => {
+        const x = (i / (values.length - 1)) * (w - pad * 2) + pad;
+        const y = (h - pad) - ((v - min) / span) * (h - pad * 2);
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+      }).join(' ');
+      line.setAttribute('points', pts);
+      document.getElementById('rssi-min').textContent = `min: ${min.toFixed(1)} dBm`;
+      document.getElementById('rssi-cur').textContent = `cur: ${values[values.length-1].toFixed(1)} dBm`;
+      document.getElementById('rssi-max').textContent = `max: ${max.toFixed(1)} dBm`;
+    }
+
     function onData(data){
       const cl = data.classification || {};
       const fe = data.features || {};
       const det = cl.detector || {};
       const g = computeRenderGate(cl, det);
+      const probs = cl.hf_probs || {};
       const motion = cl.motion_level || 'absent';
       const motionEl = document.getElementById('motion-display');
       motionEl.textContent = motion.replace(/_/g,' ');
@@ -160,6 +205,10 @@
       document.getElementById('conf-pct').textContent = conf + '%';
       document.getElementById('conf-bar').style.width = conf + '%';
       document.getElementById('m-rssi').textContent = fe.mean_rssi!=null ? Number(fe.mean_rssi).toFixed(1)+' dBm' : '-';
+      if(fe.mean_rssi != null){
+        rssiHistory.push(Number(fe.mean_rssi));
+        if(rssiHistory.length > rssiHistoryMax) rssiHistory.shift();
+      }
       document.getElementById('m-var').textContent = fe.variance!=null ? Number(fe.variance).toFixed(4) : '-';
       document.getElementById('m-mot').textContent = fe.motion_band_power!=null ? Number(fe.motion_band_power).toFixed(4) : '-';
       document.getElementById('m-src').textContent = (data.source||'-') + (data.interface ? (' ('+data.interface+')') : '');
@@ -173,6 +222,11 @@
       document.getElementById('gate-between').textContent = g.betweenGate ? 'pass' : 'fail';
       document.getElementById('gate-ibs').textContent = det.in_between_score!=null ? Number(det.in_between_score).toFixed(2) : '-';
       document.getElementById('gate-atten').textContent = det.delta_from_baseline!=null ? Number(det.delta_from_baseline).toFixed(2)+' dB' : '-';
+      document.getElementById('p-absent').textContent = probs.absent!=null ? (Number(probs.absent)*100).toFixed(0)+'%' : '-';
+      document.getElementById('p-still').textContent = probs.present_still!=null ? (Number(probs.present_still)*100).toFixed(0)+'%' : '-';
+      document.getElementById('p-active').textContent = probs.active!=null ? (Number(probs.active)*100).toFixed(0)+'%' : '-';
+      const graphValues = (Array.isArray(data.rssi_window) && data.rssi_window.length > 1) ? data.rssi_window : rssiHistory;
+      renderSparkline(graphValues);
       const ts = Number(data.timestamp||0) * 1000;
       if(ts>0){
         const age = Math.max(0, Date.now()-ts);
@@ -206,13 +260,39 @@
     }
 
     let ws = null;
+    let reconnectTimer = null;
+    let reconnectAttempt = 0;
+
+    function scheduleReconnect(){
+      if(reconnectTimer) return;
+      reconnectAttempt += 1;
+      const delay = Math.min(6000, 1500 + reconnectAttempt * 500);
+      setLog(`[${new Date().toLocaleTimeString()}] retrying WebSocket in ${Math.round(delay/1000)}s...`);
+      reconnectTimer = setTimeout(()=>{
+        reconnectTimer = null;
+        connect();
+      }, delay);
+    }
+
     function connect(){
       const url = 'ws://'+window.location.host+'/ws/sensing';
       setLog(`[${new Date().toLocaleTimeString()}] WS connect ${url}`);
       ws = new WebSocket(url);
-      ws.onopen = ()=>{ setConn(true,'connected'); setLog(`[${new Date().toLocaleTimeString()}] WS open ${url}`); };
-      ws.onclose = ()=>{ setConn(false,'disconnected'); setTimeout(connect, 2000); };
-      ws.onerror = ()=>{ setConn(false,'error'); };
+      ws.onopen = ()=>{
+        reconnectAttempt = 0;
+        if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer = null; }
+        setConn(true,'connected');
+        setLog(`[${new Date().toLocaleTimeString()}] WS open ${url}`);
+      };
+      ws.onclose = ()=>{
+        setConn(false,'disconnected');
+        scheduleReconnect();
+      };
+      ws.onerror = ()=>{
+        setConn(false,'error');
+        scheduleReconnect();
+        try { ws.close(); } catch(_e) {}
+      };
       ws.onmessage = ev => { try{ onData(JSON.parse(ev.data)); }catch(_e){} };
     }
     connect();
@@ -231,4 +311,3 @@
   </script>
 </body>
 </html>
-
