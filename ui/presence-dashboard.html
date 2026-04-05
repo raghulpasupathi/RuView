@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RuView - 3D RSSI presence</title>
+  <style>
+    :root {
+      --bg: #06080f; --panel: rgba(12,18,32,.92); --border: #1a3a55;
+      --text: #e8f0ff; --muted: #7a9ab8; --ok: #2ee59d; --hot: #ff4466;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: "Segoe UI", system-ui, sans-serif; }
+    #app { display: grid; grid-template-columns: min(380px, 40vw) 1fr; height: 100vh; }
+    #hud { border-right: 1px solid var(--border); background: var(--panel); padding: 1rem; overflow-y: auto; }
+    #viewport { position: relative; min-height: 220px; }
+    .status-row { display: flex; justify-content: space-between; font-size: .82rem; margin: .22rem 0; }
+    .metrics { display:grid; grid-template-columns:1fr 1fr; gap:.35rem .8rem; font-size:.78rem; }
+    .metrics dt { margin:0; color:var(--muted);} .metrics dd { margin:0; font-variant-numeric:tabular-nums; }
+    .bar-wrap { height: 6px; background: #1a2538; border-radius: 3px; overflow: hidden; }
+    .bar-fill { height:100%; width:0%; background: linear-gradient(90deg, #2a5a8a, var(--ok)); }
+    .big-state { font-size: 1.75rem; font-weight: 700; margin: .35rem 0; }
+    .big-state.absent { color: var(--muted); } .big-state.still { color: var(--ok); } .big-state.active { color: var(--hot); }
+    .gate-box { margin-top:.6rem; border:1px solid var(--border); border-radius:6px; padding:.5rem; background:#0a101c; font-size:.74rem; }
+    .gate-title { font-weight:600; color:#cde1ff; margin-bottom:.35rem; }
+    .gate-doc { color: var(--muted); font-size:.68rem; line-height:1.35; margin-bottom:.35rem; }
+    .dot { width:8px; height:8px; border-radius:50%; background:var(--hot); display:inline-block; margin-right:6px; }
+    .dot.live { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+    .overlay-3d { position:absolute; left:12px; right:12px; bottom:12px; color: var(--muted); font-size:.72rem; pointer-events:none; }
+    .render-stamp { position:absolute; top:12px; left:12px; border:1px solid rgba(58,95,135,.6); background:rgba(10,16,28,.72); border-radius:6px; padding:.35rem .5rem; font-size:.72rem; z-index:3; }
+    #log { margin-top:.45rem; min-height:120px; max-height:220px; overflow-y:auto; font-family: ui-monospace, monospace; font-size:.67rem; background:#080c14; border:1px solid var(--border); border-radius:6px; padding:.45rem; color:#9ec8e8; white-space:pre-wrap; }
+    @media (max-width: 760px){ #app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <aside id="hud">
+      <h1 style="margin:0 0 .3rem 0; font-size:1rem;">3D RSSI presence</h1>
+      <div class="status-row"><span>WebSocket</span><span><span id="conn-dot" class="dot"></span><span id="conn-text">disconnected</span></span></div>
+      <div class="big-state absent" id="motion-display">-</div>
+      <div class="status-row"><span>Stable presence</span><strong id="presence-stable">-</strong></div>
+      <div class="status-row"><span>Raw classifier</span><strong id="presence-raw">-</strong></div>
+      <div class="status-row"><span>Confidence</span><span id="conf-pct">0%</span></div>
+      <div class="bar-wrap"><div class="bar-fill" id="conf-bar"></div></div>
+      <dl class="metrics" style="margin-top:.55rem;">
+        <dt>Mean RSSI</dt><dd id="m-rssi">-</dd>
+        <dt>Variance</dt><dd id="m-var">-</dd>
+        <dt>Motion band</dt><dd id="m-mot">-</dd>
+        <dt>Source</dt><dd id="m-src">-</dd>
+        <dt>Node dist</dt><dd id="m-dist">-</dd>
+        <dt>Occ score</dt><dd id="m-occ">-</dd>
+        <dt>Near-field</dt><dd id="m-near">-</dd>
+      </dl>
+      <div class="gate-box">
+        <div class="gate-title">Render Gate</div>
+        <div class="gate-doc">Person tag + green board ON when: presence=yes, confidence >= 80%, near-field <= 0.35, between_gate=1.</div>
+        <div class="status-row"><span>Gate now</span><strong id="gate-now">-</strong></div>
+        <div class="status-row"><span>Between gate</span><strong id="gate-between">-</strong></div>
+        <div class="status-row"><span>In-between score</span><strong id="gate-ibs">-</strong></div>
+        <div class="status-row"><span>Attenuation</span><strong id="gate-atten">-</strong></div>
+      </div>
+      <div style="margin-top:.55rem; font-size:.72rem; color:var(--muted);">Event log</div>
+      <div id="log"></div>
+    </aside>
+    <div id="viewport">
+      <div class="render-stamp" id="render-stamp">Frame: -<br/>Age: -</div>
+      <div class="overlay-3d">Violet sphere = router/AP proxy · Cyan sphere = client node · Red marker = person proxy</div>
+    </div>
+  </div>
+  <script src="https://unpkg.com/three@0.146.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/three@0.146.0/examples/js/controls/OrbitControls.js"></script>
+  <script>
+  (function(){
+    const gridSize = 20;
+    const viewport = document.getElementById('viewport');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0e1a);
+    const camera = new THREE.PerspectiveCamera(45, viewport.clientWidth / Math.max(1, viewport.clientHeight), 0.1, 200);
+    camera.position.set(0, 10, 14);
+    const renderer = new THREE.WebGLRenderer({antialias: true});
+    renderer.setSize(viewport.clientWidth, viewport.clientHeight);
+    viewport.appendChild(renderer.domElement);
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.target.set(0,0,0);
+    const ambient = new THREE.AmbientLight(0x9ec7ff, 0.35); scene.add(ambient);
+    const dir = new THREE.DirectionalLight(0x9ec7ff, 0.65); dir.position.set(4,10,6); scene.add(dir);
+    scene.add(new THREE.GridHelper(20, 20, 0x1a3a4a, 0x0d1f28));
+
+    const fieldGeo = new THREE.BufferGeometry();
+    const positions = new Float32Array(gridSize * gridSize * 3);
+    const colors = new Float32Array(gridSize * gridSize * 3);
+    const sizes = new Float32Array(gridSize * gridSize);
+    for(let z=0; z<gridSize; z++){
+      for(let x=0; x<gridSize; x++){
+        const i = z*gridSize + x;
+        positions[i*3] = (x-gridSize/2)+0.5;
+        positions[i*3+1] = 0.05;
+        positions[i*3+2] = (z-gridSize/2)+0.5;
+        colors[i*3] = 0.25; colors[i*3+1]=0.08; colors[i*3+2]=0.08;
+        sizes[i] = 2.0;
+      }
+    }
+    fieldGeo.setAttribute('position', new THREE.BufferAttribute(positions,3));
+    fieldGeo.setAttribute('color', new THREE.BufferAttribute(colors,3));
+    fieldGeo.setAttribute('size', new THREE.BufferAttribute(sizes,1));
+    const fieldMat = new THREE.ShaderMaterial({
+      transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, vertexColors:true,
+      vertexShader:`attribute float size; varying vec3 vColor; void main(){vColor=color; vec4 mv=modelViewMatrix*vec4(position,1.0); gl_PointSize=size*(260.0/-mv.z); gl_Position=projectionMatrix*mv;}`,
+      fragmentShader:`varying vec3 vColor; void main(){float d=length(gl_PointCoord-vec2(.5)); if(d>.5) discard; gl_FragColor=vec4(vColor,(1.0-d*2.0)*0.85);}`,
+    });
+    const field = new THREE.Points(fieldGeo, fieldMat); scene.add(field);
+
+    const router = new THREE.Mesh(new THREE.SphereGeometry(0.30,18,18), new THREE.MeshBasicMaterial({color:0x8a5cff, transparent:true, opacity:.9}));
+    router.position.set(0,0.5,0); scene.add(router);
+    const node = new THREE.Mesh(new THREE.SphereGeometry(0.25,18,18), new THREE.MeshBasicMaterial({color:0x00ccff, transparent:true, opacity:.85}));
+    node.position.set(2.5,0.5,0); scene.add(node);
+    const linkGeom = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0.5,0), new THREE.Vector3(2.5,0.5,0)]);
+    const link = new THREE.Line(linkGeom, new THREE.LineBasicMaterial({color:0x73c5ff, transparent:true, opacity:.9})); scene.add(link);
+
+    const person = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(.22,.24,1.0,18), new THREE.MeshBasicMaterial({color:0xff3b30, transparent:true, opacity:.94}));
+    body.position.y = .72; person.add(body);
+    const head = new THREE.Mesh(new THREE.SphereGeometry(.2,18,18), new THREE.MeshBasicMaterial({color:0xff6b5e, transparent:true, opacity:.96}));
+    head.position.y = 1.4; person.add(head);
+    const base = new THREE.Mesh(new THREE.CircleGeometry(.34,24), new THREE.MeshBasicMaterial({color:0xff2a1f, transparent:true, opacity:.38}));
+    base.rotation.x = -Math.PI/2; base.position.y=.02; person.add(base);
+    person.visible = false; person.position.set(.9,0,0); scene.add(person);
+
+    function computeRenderGate(cl, det){
+      const confGate = Number(cl.confidence||0) >= 0.80;
+      const nearPenalty = Number(det.near_field_penalty ?? 1);
+      const betweenGate = Number(det.between_gate ?? 0) >= 0.5;
+      const strict = !!cl.presence && confGate && nearPenalty <= 0.35 && betweenGate;
+      return { strict, confGate, nearPenalty, betweenGate };
+    }
+
+    function setConn(ok, text){
+      const dot=document.getElementById('conn-dot'); const t=document.getElementById('conn-text');
+      dot.className = 'dot ' + (ok ? 'live' : '');
+      t.textContent = text;
+    }
+
+    function setLog(line){
+      const el=document.getElementById('log');
+      el.textContent = line + '\n' + el.textContent.split('\n').slice(0,40).join('\n');
+    }
+
+    function onData(data){
+      const cl = data.classification || {};
+      const fe = data.features || {};
+      const det = cl.detector || {};
+      const g = computeRenderGate(cl, det);
+      const motion = cl.motion_level || 'absent';
+      const motionEl = document.getElementById('motion-display');
+      motionEl.textContent = motion.replace(/_/g,' ');
+      motionEl.className = 'big-state ' + (motion==='active'?'active':motion==='present_still'?'still':'absent');
+      document.getElementById('presence-stable').textContent = cl.presence ? 'yes' : 'no';
+      document.getElementById('presence-raw').textContent = (typeof cl.raw_presence === 'boolean') ? (cl.raw_presence ? 'yes':'no') : '-';
+      const conf = Math.round((Number(cl.confidence||0))*100);
+      document.getElementById('conf-pct').textContent = conf + '%';
+      document.getElementById('conf-bar').style.width = conf + '%';
+      document.getElementById('m-rssi').textContent = fe.mean_rssi!=null ? Number(fe.mean_rssi).toFixed(1)+' dBm' : '-';
+      document.getElementById('m-var').textContent = fe.variance!=null ? Number(fe.variance).toFixed(4) : '-';
+      document.getElementById('m-mot').textContent = fe.motion_band_power!=null ? Number(fe.motion_band_power).toFixed(4) : '-';
+      document.getElementById('m-src').textContent = (data.source||'-') + (data.interface ? (' ('+data.interface+')') : '');
+      const pos = data.nodes && data.nodes[0] && data.nodes[0].position ? data.nodes[0].position : [2.5,0,0];
+      const dx = Number(pos[0]||0), dz = Number(pos[2]||0);
+      document.getElementById('m-dist').textContent = Math.sqrt(dx*dx+dz*dz).toFixed(2)+' m';
+      document.getElementById('m-occ').textContent = det.occupancy_score!=null ? Number(det.occupancy_score).toFixed(2) : '-';
+      document.getElementById('m-near').textContent = det.near_field_penalty!=null ? Number(det.near_field_penalty).toFixed(2) : '-';
+      document.getElementById('gate-now').textContent = g.strict ? 'ON' : 'OFF';
+      document.getElementById('gate-now').style.color = g.strict ? 'var(--ok)' : 'var(--hot)';
+      document.getElementById('gate-between').textContent = g.betweenGate ? 'pass' : 'fail';
+      document.getElementById('gate-ibs').textContent = det.in_between_score!=null ? Number(det.in_between_score).toFixed(2) : '-';
+      document.getElementById('gate-atten').textContent = det.delta_from_baseline!=null ? Number(det.delta_from_baseline).toFixed(2)+' dB' : '-';
+      const ts = Number(data.timestamp||0) * 1000;
+      if(ts>0){
+        const age = Math.max(0, Date.now()-ts);
+        document.getElementById('render-stamp').innerHTML = 'Frame: '+new Date(ts).toLocaleTimeString()+'<br/>Age: '+(age/1000).toFixed(2)+'s';
+      }
+
+      node.position.set(dx*1.8, 0.5, dz*1.8);
+      const arr = link.geometry.attributes.position.array;
+      arr[0]=0;arr[1]=.5;arr[2]=0;arr[3]=node.position.x;arr[4]=.5;arr[5]=node.position.z;
+      link.geometry.attributes.position.needsUpdate = true;
+
+      const vals = data.signal_field && Array.isArray(data.signal_field.values) ? data.signal_field.values : null;
+      if(vals){
+        const cArr = field.geometry.attributes.color.array;
+        const sArr = field.geometry.attributes.size.array;
+        const n = Math.min(vals.length, gridSize*gridSize);
+        for(let i=0;i<n;i++){
+          const v = Number(vals[i]||0);
+          if(g.strict){ cArr[i*3]=0.06; cArr[i*3+1]=0.92; cArr[i*3+2]=0.16; }
+          else { cArr[i*3]=0.25+0.75*v; cArr[i*3+1]=0.08+0.22*(1-v); cArr[i*3+2]=0.08+0.15*(1-v); }
+          sArr[i]=1.0 + v*4.0;
+        }
+        field.geometry.attributes.color.needsUpdate = true;
+        field.geometry.attributes.size.needsUpdate = true;
+      }
+
+      person.visible = g.strict;
+      if(g.strict){
+        person.position.set(node.position.x * 0.55, 0, node.position.z * 0.55);
+      }
+    }
+
+    let ws = null;
+    function connect(){
+      const url = 'ws://'+window.location.host+'/ws/sensing';
+      setLog(`[${new Date().toLocaleTimeString()}] WS connect ${url}`);
+      ws = new WebSocket(url);
+      ws.onopen = ()=>{ setConn(true,'connected'); setLog(`[${new Date().toLocaleTimeString()}] WS open ${url}`); };
+      ws.onclose = ()=>{ setConn(false,'disconnected'); setTimeout(connect, 2000); };
+      ws.onerror = ()=>{ setConn(false,'error'); };
+      ws.onmessage = ev => { try{ onData(JSON.parse(ev.data)); }catch(_e){} };
+    }
+    connect();
+
+    function anim(){
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(anim);
+    }
+    anim();
+    window.addEventListener('resize', ()=>{
+      const w=viewport.clientWidth,h=Math.max(220,viewport.clientHeight);
+      camera.aspect=w/h; camera.updateProjectionMatrix(); renderer.setSize(w,h);
+    });
+  })();
+  </script>
+</body>
+</html>
+

@@ -1,381 +1,176 @@
 """
-WebSocket sensing server.
-
-Lightweight asyncio server that bridges the WiFi sensing pipeline to the
-browser UI.  Runs the RSSI feature extractor + classifier on a 500 ms
-tick and broadcasts JSON frames to all connected WebSocket clients on
-``ws://localhost:8765``.
-
-Usage
------
-    pip install websockets
-    python -m v1.src.sensing.ws_server          # or  python v1/src/sensing/ws_server.py
-
-Data sources (tried in order):
-    1. ESP32 CSI over UDP port 5005 (ADR-018 binary frames)
-    2. Windows WiFi RSSI via netsh
-    3. Linux WiFi RSSI via /proc/net/wireless
-    4. Simulated collector (fallback)
+RSSI sensing server with WebSocket stream + dashboard HTTP endpoints.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
 import math
 import signal
-import socket
-import struct
-import sys
-import threading
 import time
-from collections import deque
-from typing import Dict, List, Optional, Set
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
-import numpy as np
-
-# Sensing pipeline imports
-from v1.src.sensing.rssi_collector import (
-    WifiSample,
-    RingBuffer,
-)
-from v1.src.sensing.feature_extractor import RssiFeatureExtractor, RssiFeatures
 from v1.src.sensing.classifier import MotionLevel, PresenceClassifier, SensingResult
+from v1.src.sensing.feature_extractor import RssiFeatureExtractor, RssiFeatures
+from v1.src.sensing.rssi_collector import WifiSample, create_collector
+from v1.src.sensing.coarse_detector import AdaptiveCoarseDetector
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-HOST = "localhost"
-PORT = 8765
-TICK_INTERVAL = 0.5  # seconds between broadcasts
-SIGNAL_FIELD_GRID = 20  # NxN grid for signal field visualization
-ESP32_UDP_PORT = 5005
+_ROOT = Path(__file__).resolve().parents[3]
 
 
-# ---------------------------------------------------------------------------
-# ESP32 UDP Collector — reads ADR-018 binary frames
-# ---------------------------------------------------------------------------
+@dataclass
+class ServerConfig:
+    host: str = "127.0.0.1"
+    port: int = 8765
+    tick_interval: float = 0.5
+    window_seconds: float = 20.0
+    interface: str = "wlan0"
+    wifi_only: bool = False
+    presence_variance: float = 0.3
+    motion_energy: float = 0.06
+    present_enter_ticks: int = 2
+    absent_exit_ticks: int = 4
+    rssi_ema_alpha: float = 0.25
+    rssi_median_kernel: int = 3
+    log_jsonl: Optional[Path] = None
+    node_distance_m: float = 2.5
 
-class Esp32UdpCollector:
-    """
-    Collects real CSI data from ESP32 nodes via UDP (ADR-018 binary format).
 
-    Parses I/Q pairs, computes mean amplitude per frame, and stores it as
-    an RSSI-equivalent value in the standard WifiSample ring buffer so the
-    existing feature extractor and classifier work unchanged.
+class PresenceHysteresis:
+    def __init__(self, enter_ticks: int, exit_ticks: int) -> None:
+        self.enter_ticks = max(1, int(enter_ticks))
+        self.exit_ticks = max(1, int(exit_ticks))
+        self._stable = False
+        self._enter = 0
+        self._exit = 0
 
-    Also keeps the last parsed CSI frame for the UI to show subcarrier data.
-    """
-
-    # ADR-018 header: magic(4) node_id(1) n_ant(1) n_sc(2) freq(4) seq(4) rssi(1) noise(1) reserved(2)
-    MAGIC = 0xC5110001
-    HEADER_SIZE = 20
-    HEADER_FMT = '<IBBHIIBB2x'
-
-    def __init__(
-        self,
-        bind_addr: str = "0.0.0.0",
-        port: int = ESP32_UDP_PORT,
-        sample_rate_hz: float = 10.0,
-        buffer_seconds: int = 120,
-    ) -> None:
-        self._bind = bind_addr
-        self._port = port
-        self._rate = sample_rate_hz
-        self._buffer = RingBuffer(max_size=int(sample_rate_hz * buffer_seconds))
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._sock: Optional[socket.socket] = None
-
-        # Last CSI frame for enhanced UI
-        self.last_csi: Optional[Dict] = None
-        self._frames_received = 0
-
-    @property
-    def sample_rate_hz(self) -> float:
-        return self._rate
-
-    @property
-    def frames_received(self) -> int:
-        return self._frames_received
-
-    def start(self) -> None:
-        if self._running:
-            return
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.settimeout(1.0)
-        self._sock.bind((self._bind, self._port))
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._recv_loop, daemon=True, name="esp32-udp-collector"
-        )
-        self._thread.start()
-        logger.info("Esp32UdpCollector listening on %s:%d", self._bind, self._port)
-
-    def stop(self) -> None:
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        if self._sock:
-            self._sock.close()
-            self._sock = None
-        logger.info("Esp32UdpCollector stopped (%d frames received)", self._frames_received)
-
-    def get_samples(self, n: Optional[int] = None) -> List[WifiSample]:
-        if n is not None:
-            return self._buffer.get_last_n(n)
-        return self._buffer.get_all()
-
-    def _recv_loop(self) -> None:
-        while self._running:
-            try:
-                data, addr = self._sock.recvfrom(4096)
-                self._parse_and_store(data, addr)
-            except socket.timeout:
-                continue
-            except Exception:
-                if self._running:
-                    logger.exception("Error receiving ESP32 UDP packet")
-
-    def _parse_and_store(self, raw: bytes, addr) -> None:
-        if len(raw) < self.HEADER_SIZE:
-            return
-
-        magic, node_id, n_ant, n_sc, freq_mhz, seq, rssi_u8, noise_u8 = \
-            struct.unpack_from(self.HEADER_FMT, raw, 0)
-
-        if magic != self.MAGIC:
-            return
-
-        rssi = rssi_u8 if rssi_u8 < 128 else rssi_u8 - 256
-        noise = noise_u8 if noise_u8 < 128 else noise_u8 - 256
-
-        # Parse I/Q data if available
-        iq_count = n_ant * n_sc
-        iq_bytes_needed = self.HEADER_SIZE + iq_count * 2
-        amplitude_list = []
-
-        if len(raw) >= iq_bytes_needed and iq_count > 0:
-            iq_raw = struct.unpack_from(f'<{iq_count * 2}b', raw, self.HEADER_SIZE)
-            i_vals = np.array(iq_raw[0::2], dtype=np.float64)
-            q_vals = np.array(iq_raw[1::2], dtype=np.float64)
-            amplitudes = np.sqrt(i_vals ** 2 + q_vals ** 2)
-            mean_amp = float(np.mean(amplitudes))
-            amplitude_list = amplitudes.tolist()
+    def update(self, raw_presence: bool) -> bool:
+        if raw_presence:
+            self._enter += 1
+            self._exit = 0
+            if not self._stable and self._enter >= self.enter_ticks:
+                self._stable = True
         else:
-            mean_amp = 0.0
-
-        # Store enhanced CSI info for UI
-        self.last_csi = {
-            "node_id": node_id,
-            "n_antennas": n_ant,
-            "n_subcarriers": n_sc,
-            "freq_mhz": freq_mhz,
-            "sequence": seq,
-            "rssi_dbm": rssi,
-            "noise_floor_dbm": noise,
-            "mean_amplitude": mean_amp,
-            "amplitude": amplitude_list[:56],  # cap for JSON size
-            "source_addr": f"{addr[0]}:{addr[1]}",
-        }
-
-        # Use RSSI from the ESP32 frame header as the primary signal metric.
-        # If RSSI is the default -80 placeholder, derive a pseudo-RSSI from
-        # mean amplitude to keep the feature extractor meaningful.
-        effective_rssi = float(rssi)
-        if rssi == -80 and mean_amp > 0:
-            # Map amplitude (typically 1-20) to dBm range (-70 to -30)
-            effective_rssi = -70.0 + min(mean_amp, 20.0) * 2.0
-
-        sample = WifiSample(
-            timestamp=time.time(),
-            rssi_dbm=effective_rssi,
-            noise_dbm=float(noise),
-            link_quality=max(0.0, min(1.0, (effective_rssi + 100.0) / 60.0)),
-            tx_bytes=seq * 1500,
-            rx_bytes=seq * 3000,
-            retry_count=0,
-            interface=f"esp32-node{node_id}",
-        )
-        self._buffer.append(sample)
-        self._frames_received += 1
+            self._exit += 1
+            self._enter = 0
+            if self._stable and self._exit >= self.exit_ticks:
+                self._stable = False
+        return self._stable
 
 
-# ---------------------------------------------------------------------------
-# Probe for ESP32 UDP
-# ---------------------------------------------------------------------------
-
-def probe_esp32_udp(port: int = ESP32_UDP_PORT, timeout: float = 2.0) -> bool:
-    """Return True if an ESP32 is actively streaming on the UDP port."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.settimeout(timeout)
-    try:
-        sock.bind(("0.0.0.0", port))
-        data, _ = sock.recvfrom(256)
-        if len(data) >= 20:
-            magic = struct.unpack_from('<I', data, 0)[0]
-            return magic == 0xC5110001
-        return False
-    except (socket.timeout, OSError):
-        return False
-    finally:
-        sock.close()
+def smooth_rssi_samples_median(samples: List[WifiSample], kernel: int) -> List[WifiSample]:
+    k = max(1, int(kernel))
+    if k <= 1 or len(samples) < k:
+        return samples
+    values = [s.rssi_dbm for s in samples]
+    half = k // 2
+    out: List[WifiSample] = []
+    for i, s in enumerate(samples):
+        lo = max(0, i - half)
+        hi = min(len(samples), i + half + 1)
+        med = sorted(values[lo:hi])[len(values[lo:hi]) // 2]
+        out.append(replace(s, rssi_dbm=float(med)))
+    return out
 
 
-# ---------------------------------------------------------------------------
-# Signal field generator
-# ---------------------------------------------------------------------------
+def smooth_rssi_samples_ema(samples: List[WifiSample], alpha: float) -> List[WifiSample]:
+    a = float(alpha)
+    if a <= 0.0 or a >= 1.0 or len(samples) < 2:
+        return samples
+    out: List[WifiSample] = []
+    ema = samples[0].rssi_dbm
+    out.append(samples[0])
+    for s in samples[1:]:
+        ema = a * s.rssi_dbm + (1.0 - a) * ema
+        out.append(replace(s, rssi_dbm=float(ema)))
+    return out
 
-def generate_signal_field(
-    features: RssiFeatures,
-    result: SensingResult,
-    grid_size: int = SIGNAL_FIELD_GRID,
-    csi_data: Optional[Dict] = None,
-) -> Dict:
-    """
-    Generate a 2-D signal-strength field for the Gaussian splat visualization.
-    When real CSI amplitude data is available, it modulates the field.
-    """
-    field = np.zeros((grid_size, grid_size), dtype=np.float64)
 
-    # Base noise floor
-    rng = np.random.default_rng(int(abs(features.mean * 100)) % (2**31))
-    field += rng.uniform(0.02, 0.08, size=(grid_size, grid_size))
-
-    cx, cy = grid_size // 2, grid_size // 2
-
-    # Radial attenuation from router
-    for y in range(grid_size):
-        for x in range(grid_size):
-            dist = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-            attenuation = max(0.0, 1.0 - dist / (grid_size * 0.7))
-            field[y, x] += attenuation * 0.3
-
-    # If we have real CSI subcarrier amplitudes, paint them along one axis
-    if csi_data and csi_data.get("amplitude"):
-        amps = np.array(csi_data["amplitude"][:grid_size], dtype=np.float64)
-        if len(amps) > 0:
-            max_a = np.max(amps) if np.max(amps) > 0 else 1.0
-            norm_amps = amps / max_a
-            # Spread subcarrier energy as vertical stripes
-            for ix, a in enumerate(norm_amps):
-                col = int(ix * grid_size / len(norm_amps))
-                col = min(col, grid_size - 1)
-                field[:, col] += a * 0.4
-
+def generate_signal_field(features: RssiFeatures, result: SensingResult, grid_size: int = 20) -> Dict:
+    field = [[0.05 for _ in range(grid_size)] for _ in range(grid_size)]
+    cx = grid_size // 2
+    cz = grid_size // 2
+    motion = max(0.0, min(1.0, features.motion_band_power / 6.0))
+    vari = max(0.0, min(1.0, features.variance / 4.0))
     if result.presence_detected:
-        body_x = cx + int(3 * math.sin(time.time() * 0.2))
-        body_y = cy + int(2 * math.cos(time.time() * 0.15))
-        sigma = 2.0 + features.variance * 0.5
-
-        for y in range(grid_size):
+        px = cx + int(3 * math.sin(time.time() * 0.25))
+        pz = cz + int(2 * math.cos(time.time() * 0.2))
+        sigma = 2.0 + vari
+        for z in range(grid_size):
             for x in range(grid_size):
-                dx = x - body_x
-                dy = y - body_y
-                blob = math.exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma))
-                intensity = 0.3 + 0.7 * min(1.0, features.motion_band_power * 5)
-                field[y, x] += blob * intensity
-
-        if features.breathing_band_power > 0.01:
-            breath_phase = math.sin(2 * math.pi * 0.3 * time.time())
-            breath_radius = 3.0 + breath_phase * 0.8
-            for y in range(grid_size):
-                for x in range(grid_size):
-                    dist_body = math.sqrt((x - body_x) ** 2 + (y - body_y) ** 2)
-                    ring = math.exp(-((dist_body - breath_radius) ** 2) / 1.5)
-                    field[y, x] += ring * features.breathing_band_power * 2
-
-    field = np.clip(field, 0.0, 1.0)
-
-    return {
-        "grid_size": [grid_size, 1, grid_size],
-        "values": field.flatten().tolist(),
-    }
+                dx = x - px
+                dz = z - pz
+                blob = math.exp(-(dx * dx + dz * dz) / (2.0 * sigma * sigma))
+                field[z][x] += 0.25 + 0.75 * blob * (0.4 + 0.6 * motion)
+    else:
+        for z in range(grid_size):
+            for x in range(grid_size):
+                d = math.sqrt((x - cx) ** 2 + (z - cz) ** 2)
+                field[z][x] += max(0.0, 0.12 - 0.01 * d)
+    flat: List[float] = []
+    for row in field:
+        for v in row:
+            flat.append(max(0.0, min(1.0, v)))
+    return {"grid_size": [grid_size, 1, grid_size], "values": flat}
 
 
-# ---------------------------------------------------------------------------
-# WebSocket server
-# ---------------------------------------------------------------------------
-
-class SensingWebSocketServer:
-    """Async WebSocket server that broadcasts sensing updates."""
-
-    def __init__(self) -> None:
+class SensingServer:
+    def __init__(self, config: ServerConfig) -> None:
+        self.config = config
         self.clients: Set = set()
-        self.collector = None
-        self.extractor = RssiFeatureExtractor(window_seconds=10.0)
-        self.classifier = PresenceClassifier()
-        self.source: str = "unknown"
+        self.collector = create_collector(
+            preferred="windows" if config.wifi_only else "auto",
+            interface=config.interface,
+            sample_rate_hz=2.0,
+        )
+        self.source = type(self.collector).__name__.replace("Collector", "").lower()
+        self.interface_name = getattr(self.collector, "_interface", config.interface)
+        self.extractor = RssiFeatureExtractor(window_seconds=config.window_seconds)
+        self.classifier = PresenceClassifier(
+            presence_variance_threshold=config.presence_variance,
+            motion_energy_threshold=config.motion_energy,
+        )
+        self.hysteresis = PresenceHysteresis(config.present_enter_ticks, config.absent_exit_ticks)
+        self.coarse_detector = AdaptiveCoarseDetector()
         self._running = False
+        self._last_broadcast: Optional[dict] = None
 
-    def _create_collector(self):
-        """Auto-detect data source: ESP32 UDP > platform WiFi > simulated.
+    def _append_jsonl(self, payload: dict) -> None:
+        if not self.config.log_jsonl:
+            return
+        try:
+            self.config.log_jsonl.parent.mkdir(parents=True, exist_ok=True)
+            with self.config.log_jsonl.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload) + "\n")
+        except Exception:
+            logger.exception("Failed writing jsonl log")
 
-        Uses the ``create_collector`` factory (ADR-049) for platform WiFi
-        detection, which never raises and logs actionable fallback messages.
-        """
-        from .rssi_collector import create_collector
-
-        # 1. Try ESP32 UDP first
-        print("  Probing for ESP32 on UDP :5005 ...")
-        if probe_esp32_udp(ESP32_UDP_PORT, timeout=2.0):
-            logger.info("ESP32 CSI stream detected on UDP :%d", ESP32_UDP_PORT)
-            self.source = "esp32"
-            return Esp32UdpCollector(port=ESP32_UDP_PORT, sample_rate_hz=10.0)
-
-        # 2. Platform-specific WiFi (auto-detect with graceful fallback)
-        collector = create_collector(preferred="auto", sample_rate_hz=10.0)
-
-        # Map collector class to source label
-        source_map = {
-            "LinuxWifiCollector": "linux_wifi",
-            "WindowsWifiCollector": "windows_wifi",
-            "MacosWifiCollector": "macos_wifi",
-            "SimulatedCollector": "simulated",
-        }
-        self.source = source_map.get(type(collector).__name__, "unknown")
-        return collector
-
-    def _build_message(self, features: RssiFeatures, result: SensingResult) -> str:
-        """Build the JSON message to broadcast."""
-        # Get CSI-specific data if available
-        csi_data = None
-        if isinstance(self.collector, Esp32UdpCollector):
-            csi_data = self.collector.last_csi
-
-        signal_field = generate_signal_field(features, result, csi_data=csi_data)
-
-        node_info = {
-            "node_id": 1,
-            "rssi_dbm": features.mean,
-            "position": [2.0, 0.0, 1.5],
-            "amplitude": [],
-            "subcarrier_count": 0,
-        }
-
-        # Enrich with real CSI data
-        if csi_data:
-            node_info["node_id"] = csi_data.get("node_id", 1)
-            node_info["rssi_dbm"] = csi_data.get("rssi_dbm", features.mean)
-            node_info["amplitude"] = csi_data.get("amplitude", [])
-            node_info["subcarrier_count"] = csi_data.get("n_subcarriers", 0)
-            node_info["mean_amplitude"] = csi_data.get("mean_amplitude", 0)
-            node_info["freq_mhz"] = csi_data.get("freq_mhz", 0)
-            node_info["sequence"] = csi_data.get("sequence", 0)
-            node_info["source_addr"] = csi_data.get("source_addr", "")
-
+    def _build_message(
+        self,
+        features: RssiFeatures,
+        result_raw: SensingResult,
+        result_display: SensingResult,
+        raw_presence: bool,
+        detector_diag: Optional[Dict[str, float]] = None,
+    ) -> str:
         msg = {
             "type": "sensing_update",
             "timestamp": time.time(),
             "source": self.source,
-            "nodes": [node_info],
+            "interface": self.interface_name,
+            "nodes": [{
+                "node_id": 1,
+                "rssi_dbm": features.mean,
+                "position": [float(self.config.node_distance_m), 0.0, 0.0],
+                "amplitude": [],
+                "subcarrier_count": 0,
+            }],
             "features": {
                 "mean_rssi": features.mean,
                 "variance": features.variance,
@@ -391,129 +186,222 @@ class SensingWebSocketServer:
                 "kurtosis": features.kurtosis,
             },
             "classification": {
-                "motion_level": result.motion_level.value,
-                "presence": result.presence_detected,
-                "confidence": round(result.confidence, 3),
+                "motion_level": result_raw.motion_level.value,
+                "presence": result_display.presence_detected,
+                "raw_presence": raw_presence,
+                "confidence": round(float(result_display.confidence), 3),
+                "detector": detector_diag or {},
             },
-            "signal_field": signal_field,
+            "signal_field": generate_signal_field(features, result_display),
         }
         return json.dumps(msg)
 
-    async def _handler(self, websocket):
-        """Handle a single WebSocket client connection."""
-        self.clients.add(websocket)
-        remote = websocket.remote_address
-        logger.info("Client connected: %s", remote)
-        try:
-            async for _ in websocket:
-                pass
-        finally:
-            self.clients.discard(websocket)
-            logger.info("Client disconnected: %s", remote)
-
     async def _broadcast(self, message: str) -> None:
-        """Send message to all connected clients."""
         if not self.clients:
             return
-        disconnected = set()
+        dead = set()
         for ws in self.clients:
             try:
                 await ws.send(message)
             except Exception:
-                disconnected.add(ws)
-        self.clients -= disconnected
+                dead.add(ws)
+        self.clients -= dead
 
-    async def _tick_loop(self) -> None:
-        """Main sensing loop."""
+    async def tick_loop(self) -> None:
+        self._running = True
         while self._running:
             try:
-                window = self.extractor.window_seconds
-                sample_rate = self.collector.sample_rate_hz
-                n_needed = int(window * sample_rate)
+                n_needed = max(4, int(self.extractor.window_seconds * self.collector.sample_rate_hz))
                 samples = self.collector.get_samples(n=n_needed)
-
+                samples = smooth_rssi_samples_median(samples, self.config.rssi_median_kernel)
+                samples = smooth_rssi_samples_ema(samples, self.config.rssi_ema_alpha)
                 if len(samples) >= 4:
                     features = self.extractor.extract(samples)
-                    result = self.classifier.classify(features)
-                    message = self._build_message(features, result)
-                    await self._broadcast(message)
+                    rule_result = self.classifier.classify(features)
+                    adaptive_result, detector_diag = self.coarse_detector.classify(
+                        features, samples=samples, fallback_result=rule_result
+                    )
+                    raw_pres = adaptive_result.presence_detected
+                    stable = self.hysteresis.update(raw_pres)
+                    display = replace(adaptive_result, presence_detected=stable)
+                    if display.confidence < 0.80:
+                        display = replace(display, motion_level=MotionLevel.ABSENT, presence_detected=False)
 
-                    # Print status every few ticks
-                    if isinstance(self.collector, Esp32UdpCollector):
-                        csi = self.collector.last_csi
-                        if csi and self.collector.frames_received % 20 == 0:
-                            print(
-                                f"  [{csi['source_addr']}] node:{csi['node_id']} "
-                                f"seq:{csi['sequence']} sc:{csi['n_subcarriers']} "
-                                f"rssi:{csi['rssi_dbm']}dBm amp:{csi['mean_amplitude']:.1f} "
-                                f"=> {result.motion_level.value} ({result.confidence:.0%})"
-                            )
-                else:
-                    logger.debug("Waiting for samples (%d/%d)", len(samples), n_needed)
+                    msg = self._build_message(features, adaptive_result, display, raw_pres, detector_diag)
+                    await self._broadcast(msg)
+
+                    self._last_broadcast = {
+                        "ts": time.time(),
+                        "source": self.source,
+                        "motion_level": adaptive_result.motion_level.value,
+                        "presence": display.presence_detected,
+                        "raw_presence": raw_pres,
+                        "confidence": float(display.confidence),
+                        "mean_rssi": float(features.mean),
+                        "variance": float(features.variance),
+                        "motion_band_power": float(features.motion_band_power),
+                        "rssi_window": [float(s.rssi_dbm) for s in samples[-40:]],
+                    }
+                    self._append_jsonl(self._last_broadcast)
+                    logger.info(
+                        "%s source=%s motion=%s presence=%s (raw=%s) conf=%.0f%% rssi_mean=%.1f var=%.4f",
+                        time.strftime("%H:%M:%S"),
+                        self.source,
+                        adaptive_result.motion_level.value,
+                        display.presence_detected,
+                        raw_pres,
+                        display.confidence * 100.0,
+                        features.mean,
+                        features.variance,
+                    )
             except Exception:
                 logger.exception("Error in sensing tick")
-
-            await asyncio.sleep(TICK_INTERVAL)
-
-    async def run(self) -> None:
-        """Start the server and run until interrupted."""
-        try:
-            import websockets
-        except ImportError:
-            print("ERROR: 'websockets' package not found.")
-            print("Install it with:  pip install websockets")
-            sys.exit(1)
-
-        self.collector = self._create_collector()
-        self.collector.start()
-        self._running = True
-
-        print(f"\n  Sensing WebSocket server on ws://{HOST}:{PORT}")
-        print(f"  Source: {self.source}")
-        print(f"  Tick: {TICK_INTERVAL}s | Window: {self.extractor.window_seconds}s")
-        print("  Press Ctrl+C to stop\n")
-
-        async with websockets.serve(self._handler, HOST, PORT):
-            await self._tick_loop()
+            await asyncio.sleep(self.config.tick_interval)
 
     def stop(self) -> None:
-        """Stop the server gracefully."""
         self._running = False
-        if self.collector:
+        try:
             self.collector.stop()
-        logger.info("Sensing server stopped")
+        except Exception:
+            pass
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+def _http_response(status: int, content: bytes, content_type: str = "text/plain; charset=utf-8") -> Tuple[int, List[Tuple[str, str]], bytes]:
+    headers = [
+        ("Content-Type", content_type),
+        ("Content-Length", str(len(content))),
+        ("Cache-Control", "no-store"),
+    ]
+    return status, headers, content
 
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+
+def parse_args() -> ServerConfig:
+    p = argparse.ArgumentParser(description="RuView sensing WebSocket + presence dashboard")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--tick-interval", type=float, default=0.5)
+    p.add_argument("--window-seconds", type=float, default=20.0)
+    p.add_argument("--interface", default="wlan0")
+    p.add_argument("--wifi-only", action="store_true")
+    p.add_argument("--presence-variance", type=float, default=0.3)
+    p.add_argument("--motion-energy", type=float, default=0.06)
+    p.add_argument("--present-enter-ticks", type=int, default=2)
+    p.add_argument("--absent-exit-ticks", type=int, default=4)
+    p.add_argument("--rssi-ema-alpha", type=float, default=0.25)
+    p.add_argument("--rssi-median-kernel", type=int, default=3)
+    p.add_argument("--log-jsonl", type=str, default=None)
+    p.add_argument("--node-distance-m", type=float, default=2.5)
+    p.add_argument("--node-distance-ft", type=float, default=None)
+    ns = p.parse_args()
+    node_m = float(ns.node_distance_m)
+    if ns.node_distance_ft is not None:
+        node_m = float(ns.node_distance_ft) * 0.3048
+    return ServerConfig(
+        host=ns.host,
+        port=ns.port,
+        tick_interval=ns.tick_interval,
+        window_seconds=ns.window_seconds,
+        interface=ns.interface,
+        wifi_only=ns.wifi_only,
+        presence_variance=ns.presence_variance,
+        motion_energy=ns.motion_energy,
+        present_enter_ticks=ns.present_enter_ticks,
+        absent_exit_ticks=ns.absent_exit_ticks,
+        rssi_ema_alpha=ns.rssi_ema_alpha,
+        rssi_median_kernel=ns.rssi_median_kernel,
+        log_jsonl=Path(ns.log_jsonl) if ns.log_jsonl else None,
+        node_distance_m=node_m,
     )
 
-    server = SensingWebSocketServer()
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    def _shutdown(sig, frame):
-        print("\nShutting down...")
-        server.stop()
-        loop.stop()
-
-    signal.signal(signal.SIGINT, _shutdown)
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    config = parse_args()
+    server = SensingServer(config)
 
     try:
-        loop.run_until_complete(server.run())
-    except KeyboardInterrupt:
-        pass
+        import websockets
+    except Exception:
+        print("ERROR: 'websockets' package is required. Install: pip install websockets")
+        raise
+
+    server.collector.start()
+
+    async def handler(websocket, path):
+        # websocket endpoint
+        if path not in ("/ws/sensing", "/"):
+            await websocket.close()
+            return
+        server.clients.add(websocket)
+        logger.info("WS client connected: %s", websocket.remote_address)
+        try:
+            async for _ in websocket:
+                pass
+        except Exception:
+            pass
+        finally:
+            server.clients.discard(websocket)
+            logger.info("WS client disconnected: %s", websocket.remote_address)
+
+    async def process_request(path, request_headers):
+        if path in ("/ws/sensing", "/"):
+            # let websockets handle upgrade when requested
+            return None
+        if path == "/health":
+            body = json.dumps({
+                "ok": True,
+                "source": server.source,
+                "interface": server.interface_name,
+                "node_distance_m": server.config.node_distance_m,
+                "last": server._last_broadcast,
+            }).encode("utf-8")
+            return _http_response(200, body, "application/json; charset=utf-8")
+        if path in ("/", "/presence-dashboard.html"):
+            page = _ROOT / "ui" / "presence-dashboard.html"
+            if page.exists():
+                return _http_response(200, page.read_bytes(), "text/html; charset=utf-8")
+            return _http_response(404, b"ui/presence-dashboard.html missing\n")
+        return _http_response(404, b"not found\n")
+
+    print()
+    print(f"  HTTP  http://{config.host}:{config.port}/health")
+    print(f"  Dashboard  http://{config.host}:{config.port}/presence-dashboard.html")
+    print(f"  WebSocket  ws://{config.host}:{config.port}/ws/sensing  (or ws://{config.host}:{config.port}/)")
+    print(f"  Source: {server.source} | Interface: {server.interface_name}")
+    print(
+        f"  Tick: {config.tick_interval}s | Window: {config.window_seconds}s | "
+        f"Hysteresis enter={config.present_enter_ticks} exit={config.absent_exit_ticks}"
+    )
+    print(f"  Node distance (viz): {config.node_distance_m:.2f} m")
+    print("  Ctrl+C to stop")
+    print()
+
+    loop = asyncio.get_event_loop()
+    stop_event = asyncio.Event()
+
+    def _shutdown(*_args: object) -> None:
+        server.stop()
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    async def runner():
+        tick = asyncio.create_task(server.tick_loop())
+        async with websockets.serve(handler, config.host, config.port, process_request=process_request):
+            await stop_event.wait()
+        tick.cancel()
+        try:
+            await tick
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        loop.run_until_complete(runner())
     finally:
         server.stop()
-        loop.close()
 
 
 if __name__ == "__main__":
     main()
+
