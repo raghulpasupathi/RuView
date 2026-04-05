@@ -248,5 +248,13 @@ v1/src/sensing/mac_wifi
 **/node_modules/
 
 # Local build scripts
-firmware/esp32-csi-node/build_firmware.batdata/
+firmware/esp32-csi-node/build_firmware.bat
+data/
 models/
+
+# Local sensing/runtime artifacts (sensitive/machine-specific)
+rssi_log.jsonl
+_server_out.log
+_server_err.log
+_server_run.log
+trained_models/
