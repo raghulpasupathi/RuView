@@ -41,6 +41,12 @@ from v1.src.sensing.backend import (
     CommodityBackend,
     Capability,
 )
+from v1.src.sensing.coarse_detector import (
+    AdaptiveCoarseDetector,
+    CoarseDetectorConfig,
+)
+from v1.src.sensing.presence_smoothing import PresenceHysteresis
+from v1.src.sensing.hf_classifier import HfClassifier, HfClassifierConfig
 
 __all__ = [
     "LinuxWifiCollector",
@@ -55,4 +61,9 @@ __all__ = [
     "SensingBackend",
     "CommodityBackend",
     "Capability",
+    "AdaptiveCoarseDetector",
+    "CoarseDetectorConfig",
+    "PresenceHysteresis",
+    "HfClassifier",
+    "HfClassifierConfig",
 ]
