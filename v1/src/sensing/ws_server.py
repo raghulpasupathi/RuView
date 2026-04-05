@@ -19,6 +19,7 @@ from v1.src.sensing.classifier import MotionLevel, PresenceClassifier, SensingRe
 from v1.src.sensing.feature_extractor import RssiFeatureExtractor, RssiFeatures
 from v1.src.sensing.rssi_collector import WifiSample, create_collector
 from v1.src.sensing.coarse_detector import AdaptiveCoarseDetector
+from v1.src.sensing.hf_classifier import HfClassifier, HfClassifierConfig
 
 logger = logging.getLogger(__name__)
 _ROOT = Path(__file__).resolve().parents[3]
@@ -40,6 +41,9 @@ class ServerConfig:
     rssi_median_kernel: int = 3
     log_jsonl: Optional[Path] = None
     node_distance_m: float = 2.5
+    hf_model_local: Optional[Path] = None
+    hf_presence_threshold: float = 0.55
+    hf_active_threshold: float = 0.60
 
 
 class PresenceHysteresis:
@@ -138,6 +142,16 @@ class SensingServer:
         )
         self.hysteresis = PresenceHysteresis(config.present_enter_ticks, config.absent_exit_ticks)
         self.coarse_detector = AdaptiveCoarseDetector()
+        self.hf_classifier: Optional[HfClassifier] = None
+        if config.hf_model_local:
+            try:
+                self.hf_classifier = HfClassifier(
+                    HfClassifierConfig(model_local=config.hf_model_local)
+                )
+                logger.info("HF classifier loaded from %s", config.hf_model_local)
+            except Exception:
+                logger.exception("Failed to load HF classifier model: %s", config.hf_model_local)
+                self.hf_classifier = None
         self._running = False
         self._last_broadcast: Optional[dict] = None
 
@@ -157,6 +171,7 @@ class SensingServer:
         result_raw: SensingResult,
         result_display: SensingResult,
         raw_presence: bool,
+        hf_probs: Optional[Dict[str, float]] = None,
         detector_diag: Optional[Dict[str, float]] = None,
     ) -> str:
         msg = {
@@ -190,11 +205,50 @@ class SensingServer:
                 "presence": result_display.presence_detected,
                 "raw_presence": raw_presence,
                 "confidence": round(float(result_display.confidence), 3),
+                "hf_probs": hf_probs or {},
                 "detector": detector_diag or {},
             },
             "signal_field": generate_signal_field(features, result_display),
         }
         return json.dumps(msg)
+
+    def _apply_hf_classifier(self, features: RssiFeatures, rule_result: SensingResult) -> tuple[SensingResult, Dict[str, float]]:
+        if self.hf_classifier is None or not self.hf_classifier.loaded:
+            return rule_result, {}
+        fmap = {
+            "mean_rssi": features.mean,
+            "variance": features.variance,
+            "std": features.std,
+            "motion_band_power": features.motion_band_power,
+            "breathing_band_power": features.breathing_band_power,
+            "dominant_freq_hz": features.dominant_freq_hz,
+            "change_points": features.n_change_points,
+            "spectral_power": features.total_spectral_power,
+            "range": features.range,
+            "iqr": features.iqr,
+            "skewness": features.skewness,
+            "kurtosis": features.kurtosis,
+        }
+        x = self.hf_classifier.feature_vector_from_map(fmap)
+        probs = self.hf_classifier.predict_probabilities(x)
+        if not probs:
+            return rule_result, {}
+
+        p_active = float(probs.get("active", 0.0))
+        p_still = float(probs.get("present_still", 0.0))
+        p_presence = p_active + p_still
+        if p_presence < self.config.hf_presence_threshold:
+            motion = MotionLevel.ABSENT
+            presence = False
+        elif p_active >= self.config.hf_active_threshold:
+            motion = MotionLevel.ACTIVE
+            presence = True
+        else:
+            motion = MotionLevel.PRESENT_STILL
+            presence = True
+        conf = max(float(rule_result.confidence), float(max(p_presence, p_active)))
+        merged = replace(rule_result, motion_level=motion, presence_detected=presence, confidence=conf)
+        return merged, probs
 
     async def _broadcast(self, message: str) -> None:
         if not self.clients:
@@ -218,8 +272,9 @@ class SensingServer:
                 if len(samples) >= 4:
                     features = self.extractor.extract(samples)
                     rule_result = self.classifier.classify(features)
+                    result_raw, hf_probs = self._apply_hf_classifier(features, rule_result)
                     adaptive_result, detector_diag = self.coarse_detector.classify(
-                        features, samples=samples, fallback_result=rule_result
+                        features, samples=samples, fallback_result=result_raw
                     )
                     raw_pres = adaptive_result.presence_detected
                     stable = self.hysteresis.update(raw_pres)
@@ -227,7 +282,14 @@ class SensingServer:
                     if display.confidence < 0.80:
                         display = replace(display, motion_level=MotionLevel.ABSENT, presence_detected=False)
 
-                    msg = self._build_message(features, adaptive_result, display, raw_pres, detector_diag)
+                    msg = self._build_message(
+                        features,
+                        adaptive_result,
+                        display,
+                        raw_pres,
+                        hf_probs=hf_probs,
+                        detector_diag=detector_diag,
+                    )
                     await self._broadcast(msg)
 
                     self._last_broadcast = {
@@ -290,6 +352,9 @@ def parse_args() -> ServerConfig:
     p.add_argument("--rssi-ema-alpha", type=float, default=0.25)
     p.add_argument("--rssi-median-kernel", type=int, default=3)
     p.add_argument("--log-jsonl", type=str, default=None)
+    p.add_argument("--hf-model-local", type=str, default=None)
+    p.add_argument("--hf-presence-threshold", type=float, default=0.55)
+    p.add_argument("--hf-active-threshold", type=float, default=0.60)
     p.add_argument("--node-distance-m", type=float, default=2.5)
     p.add_argument("--node-distance-ft", type=float, default=None)
     ns = p.parse_args()
@@ -310,6 +375,9 @@ def parse_args() -> ServerConfig:
         rssi_ema_alpha=ns.rssi_ema_alpha,
         rssi_median_kernel=ns.rssi_median_kernel,
         log_jsonl=Path(ns.log_jsonl) if ns.log_jsonl else None,
+        hf_model_local=Path(ns.hf_model_local) if ns.hf_model_local else None,
+        hf_presence_threshold=ns.hf_presence_threshold,
+        hf_active_threshold=ns.hf_active_threshold,
         node_distance_m=node_m,
     )
 
@@ -368,6 +436,7 @@ def main() -> None:
     print(f"  Dashboard  http://{config.host}:{config.port}/presence-dashboard.html")
     print(f"  WebSocket  ws://{config.host}:{config.port}/ws/sensing  (or ws://{config.host}:{config.port}/)")
     print(f"  Source: {server.source} | Interface: {server.interface_name}")
+    print(f"  HF classifier: {'enabled' if server.hf_classifier and server.hf_classifier.loaded else 'disabled'}")
     print(
         f"  Tick: {config.tick_interval}s | Window: {config.window_seconds}s | "
         f"Hysteresis enter={config.present_enter_ticks} exit={config.absent_exit_ticks}"
@@ -376,7 +445,8 @@ def main() -> None:
     print("  Ctrl+C to stop")
     print()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     stop_event = asyncio.Event()
 
     def _shutdown(*_args: object) -> None:
@@ -404,4 +474,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
